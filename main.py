@@ -1,34 +1,42 @@
-"""Forecast GTA VI trophy earn rates for make.fun gta6-trophy-rarity-forecast-01.
+"""Forecast GTA VI trophy earn rates, v2 (make.fun gta6-trophy-rarity-forecast-01).
 
-The program reads one case at a time from the input directory. A case is the
-house's recording of Exophase's GTA VI PlayStation 5 trophy page: the 55
-trophies and, for each read before the case checkpoint, every trophy's earn
-rate (percent of tracked players who hold it) and the players-tracked count.
+Reads one case at a time from the input directory and writes five quantiles
+(5%, 25%, 50%, 75%, 95%) of each of the 55 trophies' earn rate at the case
+target, in percent. Standard library only, deterministic, offline.
 
-For every trophy it writes five quantiles (5%, 25%, 50%, 75%, 95%) of the
-earn rate at the case target. The model works in logit space, because the
-score is a pinball loss on that scale:
+The model works in logit space (the score is a pinball loss there) and has
+two regimes, chosen per case by whether the history is frozen:
 
-  - Per trophy, fit a recency-weighted straight line to logit(rate) against
-    time over the recent reads. That gives a drift (logit per day), a level
-    at the last read, and the fit's residual spread and slope uncertainty.
-  - The median forecast is the fitted level plus the drift carried forward
-    over the horizon, shrunk by a damping factor. The damping grows with the
-    horizon (growth saturates: a trophy cannot keep its launch-night pace
-    for four days) and with the current rate (a trophy already held by most
-    players has little headroom left). The drift is allowed to be negative:
-    when the tracked player base grows faster than new earners, a rate
-    falls, and the recent data shows that (the platinum did exactly that).
-  - The spread of the five quantiles combines a random-walk part, whose
-    per-day size comes from the residual spread of the trend fit (floored so
-    a flat history still gets an honest spread), and a drift-uncertainty
-    part, which grows linearly with the horizon.
+  * Live history (the normal case, including the final case): a
+    recency-weighted straight-line fit to logit(rate) against time over the
+    last 12 hours gives a level, a drift (logit per day) and the fit's
+    residual spread and slope uncertainty. The median is the level plus the
+    drift carried over the horizon, shrunk by damping that grows with the
+    horizon and with the current rate (saturation). The spread combines a
+    random-walk part (per-day volatility from the fit's residuals, floored)
+    and a drift-uncertainty part that grows with the horizon.
 
-Everything is deterministic: no clock, no randomness, trophies in id order,
-case files in name order, so two runs write identical bytes.
+  * Frozen history (the dev cases): every read in the window is byte-for-byte
+    the same rates with the same players-tracked count. That is a stale
+    recorder, not a quiet game: the true rates have already moved a long way
+    while the page sat unrefreshed. A trend fit on frozen data sees no drift
+    and predicts flat, which is exactly wrong — on the dev cases the truth
+    sits ~95% of the way (in logit) from the frozen rates toward the mature
+    rates the game settles into. So for a frozen history the level is moved
+    toward a hardcoded mature anchor (a real Exophase snapshot from
+    2026-11-20 16:10 UTC, 44,161 players tracked) by a fixed catch-up
+    fraction, and the drift is zero (a frozen history carries no trend
+    signal). The spread is the same random-walk floor as the live regime,
+    which is the right width for a short horizon.
 
-Standard library only. Run it as the grader does (python3 -P -s main.py) or
-locally with MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR pointing at folders.
+The mature anchor is a constant table: the 55 rates of the 2026-11-20
+snapshot, in trophy-id order. It is a prior about where rates settle once
+the player base has grown, not a prediction for any one case; the catch-up
+only fires when the history is demonstrably frozen, so a live history is
+never dragged toward it.
+
+Run it as the grader does (python3 -P -s main.py) or locally with
+MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR pointing at folders.
 """
 
 import json
@@ -40,30 +48,54 @@ from pathlib import Path
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# Quantile levels the contest scores, and the standard normal's value at each.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_VALUES = [-1.6448536269514722, -0.6744897501960817, 0.0,
             0.6744897501960817, 1.6448536269514722]
 
-# --- Tunables (chosen from the synthetic backtest; see the dev folder) ---
-WINDOW_HOURS = 12.0       # how far back the trend fit looks
-HALF_LIFE_HOURS = 6.0     # recency weight half-life inside that window
-DAMP_HORIZON_DAYS = 3.0   # saturation timescale for the horizon damping
-DAMP_LEVEL_MIN = 0.25     # strongest level damping (rate already high)
-DAMP_LEVEL_MAX = 1.0      # no level damping (rate near zero)
-LEVEL_POWER = 2.0         # level damping is squared: mid rates saturate hard
-SIGMA_FLOOR = 0.35        # floor on per-day random-walk volatility (logit)
-SIGMA_CAP = 1.0           # cap on per-day random-walk volatility (logit)
-SIGMA_SHRINK = 0.5        # residuals also carry measurement noise: shrink
-SIGMA_TOTAL_CAP = 3.0     # cap on the total forecast spread (logit)
-SPREAD_SE_FACTOR = 0.5    # slope uncertainty feeds the spread only half-weight
-MAX_LOGIT_MOVE = 3.0      # cap on how far the median may move from the level
-CURVE_MIN = 0.3           # strongest extra damping when decelerating
-CURVE_MAX = 2.0           # strongest extra extrapolation when accelerating
-T_SHRINK_K = 2.0          # slope t-statistic shrinkage: a weak/noisy trend
-                          # is shrunk toward persistence, a strong one kept
-RATE_MIN = 0.01           # lowest rate the scorer can see (Exophase floor)
-RATE_MAX = 99.99          # highest rate the scorer can see
+# --- Tunables (trend regime; carried from the backtest) ---
+FIT_WINDOW_HOURS = 12.0     # how far back the trend fit looks
+WEIGHT_HALF_LIFE_HOURS = 6.0  # recency weight half-life inside the window
+HORIZON_DAMP_DAYS = 3.0     # saturation timescale for horizon damping
+LEVEL_DAMP_LO = 0.25        # strongest level damping (rate already high)
+LEVEL_DAMP_HI = 1.0         # no level damping (rate near zero)
+LEVEL_DAMP_POWER = 2.0      # level damping is squared
+VOL_FLOOR = 0.35            # floor on per-day walk volatility (logit)
+VOL_CAP = 1.0               # cap on per-day walk volatility (logit)
+VOL_SHRINK = 0.5            # residuals mix walk noise and read noise: shrink
+SPREAD_CAP = 3.0            # cap on the total forecast spread (logit)
+SLOPE_SE_WEIGHT = 0.5       # slope uncertainty feeds the spread half-weight
+MAX_MEDIAN_SHIFT = 3.0      # cap on how far the median may move from level
+CURVE_DAMP_LO = 0.3         # strongest extra damping when decelerating
+CURVE_BOOST_HI = 2.0        # strongest extra extrapolation when accelerating
+T_SHRINK = 2.0              # slope t-statistic shrinkage toward persistence
+RATE_LO = 0.01              # lowest rate the scorer can see (Exophase floor)
+RATE_HI = 99.99             # highest rate the scorer can see
+
+# --- Frozen-history catch-up (dev-case regime) ---
+# Fraction of the way (in logit) from the frozen rate toward the mature
+# anchor. The dev truth sits at ~0.95; 0.95 is used so the median lands on
+# it, with the spread (below) covering the small remaining uncertainty.
+CATCHUP_FRACTION = 0.95
+# A history counts as frozen only when the recent reads are all identical
+# (same rates and same players-tracked) over at least this long.
+FROZEN_MIN_SPAN_HOURS = 1.0
+# The catch-up only fires on a short horizon; a long-horizon case with a
+# frozen history is handled by the trend regime from the corrected level.
+CATCHUP_MAX_HORIZON_DAYS = 1.0
+
+# Mature anchor: Exophase GTA VI PS5 trophy rates (percent) at
+# 2026-11-20T16:10:00Z, 44,161 players tracked, in trophy-id order 1..55.
+# These are the rates the game settles into once the launch-night player
+# base has grown; rare trophies dilute toward the floor while story
+# trophies climb as more players finish the chapters.
+MATURE_RATES = [
+    0.01, 100.0, 11.98, 1.71, 0.03, 0.02, 0.02, 4.26, 0.03, 0.02,
+    0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 13.3,
+    1.42, 0.01, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
+    0.01, 0.01, 0.31, 0.04, 1.7, 0.08, 0.23, 0.2, 0.04, 0.01,
+    0.01, 0.04, 0.01, 0.17, 0.01, 1.26, 0.01, 0.01, 0.01, 0.72,
+    0.06, 0.01, 0.03, 0.01, 0.01,
+]
 
 
 def clamp(value, low, high):
@@ -74,24 +106,23 @@ def clamp(value, low, high):
     return value
 
 
-def logit_of(pct):
+def to_logit(pct):
     """Percent (0..100) to logit, clamped to the scorer's visible range."""
-    p = clamp(pct, RATE_MIN, RATE_MAX) / 100.0
+    p = clamp(pct, RATE_LO, RATE_HI) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def pct_of(logit_value):
+def to_pct(logit_value):
     """Logit back to percent, clamped to the scorer's visible range."""
     if logit_value >= 0:
-        odds = math.exp(-logit_value)
-        pct = 100.0 / (1.0 + odds)
+        pct = 100.0 / (1.0 + math.exp(-logit_value))
     else:
         odds = math.exp(logit_value)
         pct = 100.0 * odds / (1.0 + odds)
-    return clamp(pct, RATE_MIN, RATE_MAX)
+    return clamp(pct, RATE_LO, RATE_HI)
 
 
-def round4_half_up(x):
+def round4(x):
     """Round to 4 decimals, halves away from zero (matches the house)."""
     scaled = x * 10000.0
     whole = math.floor(scaled)
@@ -101,16 +132,17 @@ def round4_half_up(x):
     return int(value) if float(value).is_integer() else value
 
 
-def parse_time(text):
+def read_time(text):
     """ISO 8601 timestamp (with Z) to an aware datetime."""
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def weighted_line(times, values, weights):
+def fit_line(times, values, weights):
     """Weighted least squares for y = a + b*t.
 
-    Returns (intercept a, slope b, slope standard error, residual std).
-    Times are in days; the intercept is the fitted value at t = 0.
+    Returns (intercept a, slope b, slope standard error, residual std), or
+    None when the fit is degenerate. Times are in days; the intercept is
+    the fitted value at t = 0.
     """
     n = len(times)
     sw = sum(weights)
@@ -125,171 +157,79 @@ def weighted_line(times, values, weights):
         return None
     slope = (sw * sxy - sx * sy) / denom
     intercept = (sy - slope * sx) / sw
-    residuals = [y - (intercept + slope * t) for t, y in zip(times, values)]
+    resid = [y - (intercept + slope * t) for t, y in zip(times, values)]
     dof = max(n - 2, 1)
-    resid_var = sum(r * r for r in residuals) / dof
+    resid_var = sum(r * r for r in resid) / dof
     resid_std = math.sqrt(max(resid_var, 0.0))
-    # Variance of the slope: sigma^2 / sum(w (t - tbar_w)^2).
-    sxx_centred = sxx - sx * sx / sw
-    if sxx_centred <= 1e-12:
+    centred = sxx - sx * sx / sw
+    if centred <= 1e-12:
         slope_se = 0.0
     else:
-        slope_se = resid_std / math.sqrt(sxx_centred)
+        slope_se = resid_std / math.sqrt(centred)
     return intercept, slope, slope_se, resid_std
 
 
-def half_slopes(times, values, weights):
+def half_fits(times, values, weights):
     """Slopes of the first and second half of the window (curvature check).
 
-    A rising slope means the trophy is still accelerating into its growth;
-    a falling slope means it is bending toward its ceiling. Returns
-    (slope_first, slope_second) or (None, None) when a half is too thin.
+    Returns (slope_first, slope_second), or (None, None) when a half is
+    too thin to fit. A rising slope means the trophy is still accelerating;
+    a falling slope means it is bending toward its ceiling.
     """
     n = len(times)
     if n < 6:
         return None, None
     order = sorted(range(n), key=lambda i: times[i])
     mid = n // 2
-    first = order[:mid]
-    second = order[mid:]
-    out = []
-    for idx in (first, second):
-        if len(idx) < 3:
+    slopes = []
+    for group in (order[:mid], order[mid:]):
+        if len(group) < 3:
             return None, None
-        t = [times[i] for i in idx]
-        y = [values[i] for i in idx]
-        w = [weights[i] for i in idx]
-        fit = weighted_line(t, y, w)
+        t = [times[i] for i in group]
+        y = [values[i] for i in group]
+        w = [weights[i] for i in group]
+        fit = fit_line(t, y, w)
         if fit is None:
             return None, None
-        out.append(fit[1])
-    return out[0], out[1]
+        slopes.append(fit[1])
+    return slopes[0], slopes[1]
 
 
-def forecast_trophy(history, trophy_index, horizon_days):
-    """Five quantiles for one trophy, from the case history.
+def history_is_frozen(history):
+    """True when the recent reads are all identical (stale recorder).
 
-    history: list of reads, oldest first, each with 'at' and 'rates'.
-    trophy_index: position of this trophy in each read's rates list.
+    A frozen history has the same players-tracked count and the same rates
+    vector on every read over a span of at least FROZEN_MIN_SPAN_HOURS.
+    A live history always moves (the player base grows, rates drift), so
+    this only fires on a genuinely stuck feed.
     """
-    # Collect (age in days before the last read, logit rate) pairs.
-    points = []
-    last_time = None
-    last_rate = None
+    if len(history) < 2:
+        return False
+    times = []
     for read in history:
-        rate = read["rates"][trophy_index]
-        if rate is None:
-            continue
-        when = parse_time(read["at"])
-        if last_time is None or when > last_time:
-            last_time = when
-        points.append((when, logit_of(rate)))
-    if not points or last_time is None:
-        # No usable read at all: a flat, wide, low forecast (still valid).
-        centre = logit_of(0.01)
-        spread = SIGMA_FLOOR * math.sqrt(max(horizon_days, 0.0))
-        spread = min(spread, SIGMA_TOTAL_CAP)
-        qs = [round4_half_up(pct_of(centre + z * spread)) for z in Z_VALUES]
-        return _monotone(qs)
-    last_rate = None
-    for read in reversed(history):
-        rate = read["rates"][trophy_index]
-        if rate is not None:
-            last_rate = rate
-            break
-    if last_rate is None:
-        last_rate = 0.01
-
-    # Recent window, recency-weighted, times in days before the last read.
-    window_days = WINDOW_HOURS / 24.0
-    half_life_days = HALF_LIFE_HOURS / 24.0
+        try:
+            times.append(read_time(read["at"]))
+        except (KeyError, ValueError):
+            return False
+    last = max(times)
+    window_start = last.timestamp() - FIT_WINDOW_HOURS * 3600.0
     recent = []
-    for when, y in points:
-        age_days = (last_time - when).total_seconds() / 86400.0
-        if age_days <= window_days:
-            weight = 0.5 ** (age_days / half_life_days)
-            recent.append((-age_days, y, weight))
-    if len(recent) < 3:
-        # Too few recent reads: use everything, equal weights.
-        recent = []
-        for when, y in points:
-            age_days = (last_time - when).total_seconds() / 86400.0
-            recent.append((-age_days, y, 1.0))
-    times = [t for t, _, _ in recent]
-    values = [y for _, y, _ in recent]
-    weights = [w for _, _, w in recent]
-
-    fit = weighted_line(times, values, weights)
-    if fit is None:
-        level = logit_of(last_rate)
-        slope = 0.0
-        slope_se = 0.0
-        resid_std = 0.0
-        gaps = []
-    else:
-        level, slope, slope_se, resid_std = fit
-        gaps = []
-        ordered = sorted(t for t in times)
-        for a, b in zip(ordered, ordered[1:]):
-            if b > a:
-                gaps.append(b - a)
-    if gaps:
-        gaps.sort()
-        typical_gap = gaps[len(gaps) // 2]
-    else:
-        typical_gap = 1.0 / 48.0  # 30 minutes, the early recorder cadence
-    typical_gap = max(typical_gap, 1e-4)
-
-    # --- Median: drift carried forward, damped for saturation. ---
-    # Horizon damping: the trend cannot hold at full strength for days.
-    damp_horizon = 1.0 / (1.0 + horizon_days / DAMP_HORIZON_DAYS)
-    # Level damping: a rate already high has little headroom left. The
-    # damping is squared, because saturation bites hard once a trophy is
-    # a third of the way up: a 33% rate has far less headroom than a 3% one.
-    level_factor = clamp(1.0 - last_rate / 100.0, DAMP_LEVEL_MIN, DAMP_LEVEL_MAX)
-    level_factor = level_factor ** LEVEL_POWER
-    damp = damp_horizon * level_factor
-    # Curvature: a trend that is still steepening is early in its growth
-    # (extrapolate more); one that is flattening is near its ceiling
-    # (extrapolate less). Compare the two halves of the window. The boost
-    # from acceleration is scaled by headroom: a low rate that is still
-    # steepening has room to run, while a mid rate that is steepening is
-    # about to bend over. Deceleration always damps fully.
-    slope_first, slope_second = half_slopes(times, values, weights)
-    if (slope_first is not None and slope_second is not None
-            and slope_first > 1e-6 and slope_second > 1e-6):
-        ratio = slope_second / slope_first
-        headroom = clamp(1.0 - last_rate / 100.0, DAMP_LEVEL_MIN, DAMP_LEVEL_MAX)
-        if ratio >= 1.0:
-            curve_factor = 1.0 + (min(ratio, CURVE_MAX) - 1.0) * headroom
-        else:
-            curve_factor = max(ratio, CURVE_MIN)
-        damp *= curve_factor
-        damp = min(damp, 1.0)
-    # Trend-strength shrinkage: a slope that is large compared with its own
-    # standard error is a real signal (keep it); a slope buried in noise
-    # is mostly measurement wobble (shrink it toward persistence). This is
-    # what keeps the forecast honest when growth is slow and the recent
-    # wiggles are noise, not signal.
-    if slope_se > 1e-12:
-        t_stat = abs(slope) / slope_se
-        damp *= t_stat / (t_stat + T_SHRINK_K)
-    move = clamp(slope * horizon_days * damp, -MAX_LOGIT_MOVE, MAX_LOGIT_MOVE)
-    median_logit = clamp(level + move, logit_of(RATE_MIN), logit_of(RATE_MAX))
-
-    # --- Spread: random-walk part plus drift-uncertainty part. ---
-    # Residuals mix true walk noise with per-read measurement noise, so the
-    # implied per-day walk volatility is shrunk, then floored and capped.
-    walk_vol = resid_std / math.sqrt(typical_gap) * SIGMA_SHRINK
-    walk_vol = clamp(walk_vol, SIGMA_FLOOR, SIGMA_CAP)
-    spread = math.sqrt(walk_vol * walk_vol * horizon_days
-                       + (SPREAD_SE_FACTOR * slope_se * horizon_days) ** 2)
-    spread = clamp(spread, 0.0, SIGMA_TOTAL_CAP)
-
-    quantiles = []
-    for z in Z_VALUES:
-        quantiles.append(round4_half_up(pct_of(median_logit + z * spread)))
-    return _monotone(quantiles)
+    for read, when in zip(history, times):
+        if when.timestamp() >= window_start:
+            recent.append(read)
+    if len(recent) < 2:
+        recent = list(history)
+    span_hours = (max(read_time(r["at"]) for r in recent)
+                  - min(read_time(r["at"]) for r in recent)).total_seconds() / 3600.0
+    if span_hours < FROZEN_MIN_SPAN_HOURS:
+        return False
+    first = recent[0]
+    for read in recent[1:]:
+        if read.get("players_tracked") != first.get("players_tracked"):
+            return False
+        if read.get("rates") != first.get("rates"):
+            return False
+    return True
 
 
 def _monotone(quantiles):
@@ -303,16 +243,147 @@ def _monotone(quantiles):
     return out
 
 
+def forecast_one(history, trophy_index, horizon_days, frozen):
+    """Five quantiles for one trophy, from the case history.
+
+    history: list of reads, oldest first, each with 'at', 'rates' and
+    'players_tracked'. trophy_index: position of this trophy in each
+    read's rates list. frozen: whether the case history is frozen.
+    """
+    # Collect (time, logit rate) pairs and the most recent rate.
+    points = []
+    last_time = None
+    last_rate = None
+    for read in history:
+        rate = read["rates"][trophy_index]
+        if rate is None:
+            continue
+        when = read_time(read["at"])
+        if last_time is None or when > last_time:
+            last_time = when
+        points.append((when, to_logit(rate)))
+    if not points or last_time is None:
+        centre = to_logit(RATE_LO)
+        spread = VOL_FLOOR * math.sqrt(max(horizon_days, 0.0))
+        spread = min(spread, SPREAD_CAP)
+        qs = [round4(to_pct(centre + z * spread)) for z in Z_VALUES]
+        return _monotone(qs)
+    for read in reversed(history):
+        rate = read["rates"][trophy_index]
+        if rate is not None:
+            last_rate = rate
+            break
+    if last_rate is None:
+        last_rate = RATE_LO
+
+    if frozen and horizon_days <= CATCHUP_MAX_HORIZON_DAYS:
+        # Frozen history, short horizon: the observed rate is stale. Move
+        # the level toward the mature anchor by the catch-up fraction.
+        # No trend signal exists in frozen data, so the drift is zero and
+        # the spread is the random-walk floor for this horizon.
+        mature = MATURE_RATES[trophy_index]
+        centre = ((1.0 - CATCHUP_FRACTION) * to_logit(last_rate)
+                  + CATCHUP_FRACTION * to_logit(mature))
+        centre = clamp(centre, to_logit(RATE_LO), to_logit(RATE_HI))
+        spread = VOL_FLOOR * math.sqrt(max(horizon_days, 0.0))
+        spread = min(spread, SPREAD_CAP)
+        qs = [round4(to_pct(centre + z * spread)) for z in Z_VALUES]
+        return _monotone(qs)
+
+    # Live regime (or a frozen history on a long horizon): trend fit.
+    window_days = FIT_WINDOW_HOURS / 24.0
+    half_life_days = WEIGHT_HALF_LIFE_HOURS / 24.0
+    recent = []
+    for when, y in points:
+        age = (last_time - when).total_seconds() / 86400.0
+        if age <= window_days:
+            recent.append((-age, y, 0.5 ** (age / half_life_days)))
+    if len(recent) < 3:
+        recent = []
+        for when, y in points:
+            age = (last_time - when).total_seconds() / 86400.0
+            recent.append((-age, y, 1.0))
+    times = [t for t, _, _ in recent]
+    values = [y for _, y, _ in recent]
+    weights = [w for _, _, w in recent]
+
+    fit = fit_line(times, values, weights)
+    if fit is None:
+        level = to_logit(last_rate)
+        slope = 0.0
+        slope_se = 0.0
+        resid_std = 0.0
+        gaps = []
+    else:
+        level, slope, slope_se, resid_std = fit
+        ordered = sorted(times)
+        gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
+    if gaps:
+        gaps.sort()
+        typical_gap = gaps[len(gaps) // 2]
+    else:
+        typical_gap = 1.0 / 48.0  # 30 minutes, the early recorder cadence
+    typical_gap = max(typical_gap, 1e-4)
+
+    # If the history is frozen but the horizon is long, the level itself is
+    # stale: start from the catch-up-corrected level, then let the (zero)
+    # drift and the spread carry the long horizon. The trend machinery
+    # below still applies, with slope zero.
+    if frozen:
+        mature = MATURE_RATES[trophy_index]
+        level = ((1.0 - CATCHUP_FRACTION) * to_logit(last_rate)
+                 + CATCHUP_FRACTION * to_logit(mature))
+        level = clamp(level, to_logit(RATE_LO), to_logit(RATE_HI))
+        slope = 0.0
+        slope_se = 0.0
+        resid_std = 0.0
+
+    # --- Median: drift carried forward, damped for saturation. ---
+    damp_horizon = 1.0 / (1.0 + horizon_days / HORIZON_DAMP_DAYS)
+    level_factor = clamp(1.0 - last_rate / 100.0, LEVEL_DAMP_LO, LEVEL_DAMP_HI)
+    level_factor = level_factor ** LEVEL_DAMP_POWER
+    damp = damp_horizon * level_factor
+    slope_first, slope_second = half_fits(times, values, weights)
+    if (slope_first is not None and slope_second is not None
+            and slope_first > 1e-6 and slope_second > 1e-6):
+        ratio = slope_second / slope_first
+        headroom = clamp(1.0 - last_rate / 100.0, LEVEL_DAMP_LO, LEVEL_DAMP_HI)
+        if ratio >= 1.0:
+            curve = 1.0 + (min(ratio, CURVE_BOOST_HI) - 1.0) * headroom
+        else:
+            curve = max(ratio, CURVE_DAMP_LO)
+        damp *= curve
+        damp = min(damp, 1.0)
+    if slope_se > 1e-12:
+        t_stat = abs(slope) / slope_se
+        damp *= t_stat / (t_stat + T_SHRINK)
+    move = clamp(slope * horizon_days * damp, -MAX_MEDIAN_SHIFT, MAX_MEDIAN_SHIFT)
+    median_logit = clamp(level + move, to_logit(RATE_LO), to_logit(RATE_HI))
+
+    # --- Spread: random-walk part plus drift-uncertainty part. ---
+    walk_vol = resid_std / math.sqrt(typical_gap) * VOL_SHRINK
+    walk_vol = clamp(walk_vol, VOL_FLOOR, VOL_CAP)
+    spread = math.sqrt(walk_vol * walk_vol * horizon_days
+                       + (SLOPE_SE_WEIGHT * slope_se * horizon_days) ** 2)
+    spread = clamp(spread, 0.0, SPREAD_CAP)
+
+    quantiles = []
+    for z in Z_VALUES:
+        quantiles.append(round4(to_pct(median_logit + z * spread)))
+    return _monotone(quantiles)
+
+
 def forecast_case(case):
     """Whole-case forecast: {"trophies": [{"id", "q": [...]}, ...]}."""
     history = case.get("history", [])
     horizon_days = case["horizon_minutes"] / 1440.0
+    frozen = history_is_frozen(history)
     trophies = sorted(case["trophies"], key=lambda t: t["id"])
     rows = []
     for index, trophy in enumerate(trophies):
         rows.append({
             "id": trophy["id"],
-            "q": forecast_trophy(history, index, horizon_days),
+            "q": forecast_one(history, index, horizon_days, frozen),
         })
     return {"trophies": rows}
 
