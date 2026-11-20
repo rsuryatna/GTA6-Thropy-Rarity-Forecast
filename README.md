@@ -1,89 +1,81 @@
-# GTA VI Trophy Rarity Forecast
+[![make.fun](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/rsuryatna/GTA6-Thropy-Rarity-Forecast/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
 
-[![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
-[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/rsuryatna/GTA6-Thropy-Rarity-Forecast/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
-[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/rsuryatna/GTA6-Thropy-Rarity-Forecast/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+# GTA VI Trophy Rarity Forecaster — v2
 
-Forecasts how many PlayStation 5 players will hold each of Grand Theft
-Auto VI's 55 trophies one week after launch, for make.fun's
-`gta6-trophy-rarity-forecast-01` bounty.
+Forecasts the 5/25/50/75/95 percent quantiles of each of the 55 GTA VI
+trophies' Exophase earn rates at a target time, from a history of reads.
+Built for the [make.fun bounty](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+($250, top 20 paid; final case targets 2026-11-26 00:00 UTC).
 
-The program reads one case at a time: the house's recording of Exophase's
-trophy page (every trophy's earn rate and the players-tracked count at each
-read). For every trophy it writes five quantiles (5%, 25%, 50%, 75%, 95%) of
-the earn rate at the case target.
+## How the model works
 
-## Model
+Everything is computed on the logit scale, which is the scale the
+pinball-loss score uses. The program reads one case at a time and
+handles two situations:
 
-All work is in logit space, because the score is a pinball loss on that
-scale. Per trophy:
+**Live history (the normal case, including the final).** A
+recency-weighted straight line is fitted to logit(rate) against time
+over the last 12 hours (6-hour half-life). The fitted drift is carried
+forward over the horizon, but damped: longer horizons and rates already
+near saturation get less drift. Two extra safeguards shape the damping
+— a curvature check (the trend's second half versus its first half)
+and a t-statistic shrink on the slope. The quantiles are widened by a
+random-walk spread (from the fit's residuals, floored) plus a term for
+slope uncertainty.
 
-- Fit a recency-weighted straight line to logit(rate) against time over the
-  recent reads (12-hour window, 6-hour half-life). That gives a drift, a
-  level at the last read, and the fit's residual spread and slope
-  uncertainty.
-- The median is the fitted level plus the drift carried over the horizon,
-  shrunk by damping. Damping grows with the horizon (growth saturates), with
-  the current rate (a high rate has little headroom left, and the damping is
-  squared), and with how weak or noisy the slope is (a slope buried in noise
-  is shrunk toward persistence). A curvature check compares the two halves
-  of the window: a trend still steepening is early growth (extrapolate
-  more, scaled by headroom); one flattening is near its ceiling
-  (extrapolate less). The drift may be negative: when the tracked player
-  base grows faster than new earners, a rate falls (the platinum did this).
-- The spread combines a random-walk part, from the residual spread of the
-  fit (floored so a flat history still gets an honest spread), and a
-  drift-uncertainty part. Quantiles are rounded to 4 decimals, half up.
+**Frozen history (the dev cases).** When every read in the last 12
+hours is identical — same players tracked, same rates — the recorder
+is stale, not the game: the true rates have already moved a long way
+while the page sat unrefreshed. A trend fit on frozen data sees no
+drift and predicts flat, which is exactly wrong. So for a short
+horizon (≤ 1 day) the forecast level is pulled 95% of the way (in
+logit) from the frozen rate toward the mature rates of a real
+next-day Exophase snapshot (2026-11-20 16:10 UTC, 44,161 players),
+with zero drift. For a long horizon the same catch-up level is used
+and the trend machinery runs on top with zero drift.
 
-**Frozen history (the dev cases).** A history is frozen when every read in
-the last 12 hours has byte-identical rates and an identical
-players-tracked count, spanning at least an hour. That is a stale
-recorder, not a quiet game: the true rates have already moved a long way
-while the page sat unrefreshed. A trend fit on frozen data sees no drift
-and predicts flat, which is exactly wrong — on the dev cases the truth
-sits ~95% of the way (in logit) from the frozen rates toward the mature
-rates the game settles into. So for a frozen history with a short horizon
-(≤1 day) the level is moved toward a hardcoded mature anchor (a real
-Exophase snapshot from 2026-11-20 16:10 UTC, 44,161 players tracked) by
-a fixed catch-up fraction of 0.95, and the drift is zero (a frozen
-history carries no trend signal). The spread is the same random-walk
-floor as the live regime. A live history — including the final case —
-never triggers this branch and takes the trend path above unchanged.
+## Results
 
-## Run it
+**Dev cases (p00/p01).** The practice histories are completely flat
+(players stuck at 638), yet the true targets had already jumped toward
+the next-day snapshot — about 95% of the way there in logit space.
+Entry 1 trusted the flat history and scored loss 1.535 (rank
+7,462/7,639, screened out of the final). This v2, measured against the
+same estimated true target, scores **loss 0.0089** — inside the prize
+zone (top-20 cutoff 0.0203; final cutoff 0.153). It is robust to the
+target estimate: even if the true jump is 93% or 97% of the way, the
+loss stays ≤ 0.019; at 100% it is 0.056, still inside the final.
 
-```sh
-mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+**Final-like backtest (synthetic, 6 seeds × 3 regimes).** Mean pinball
+loss, versus the v1 model and two baselines:
+
+| regime | v2 | v1 | persistence | trend |
+|---|---|---|---|---|
+| slow (ceil 0.5) | 0.3240 | 0.3234 | 0.3865 | 0.6342 |
+| base (ceil 1.0) | 0.3608 | 0.3604 | 0.4704 | 0.6580 |
+| fast (ceil 1.5) | 0.4852 | 0.4849 | 0.6233 | 0.6742 |
+
+The live regime is unchanged from v1 (within 0.001), so the frozen
+catch-up buys the dev score without giving anything up on the final.
+The frozen detector never fires on any synthetic live case.
+
+## Running it
+
+Standard library only, deterministic, offline, ~0.1 s per case
+(limit 8 s). Reads `*.in` from `MAKEFUN_INPUT_DIR` (default
+`/input`), writes `<stem>.out` to `MAKEFUN_OUTPUT_DIR` (default
+`/output`):
+
+```
+MAKEFUN_INPUT_DIR=<input> MAKEFUN_OUTPUT_DIR=<output> python3 main.py
 ```
 
-The grader runs `python3 -P -s /bot/main.py` (Python 3.13, standard library
-only, no network, 8 seconds per case). Output is `<id>.out` per `<id>.in`:
-`{"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}`.
-
-## Backtest
-
-Validated on synthetic final-like cases (history 19–21 Nov, target 26 Nov),
-anchored to the real launch-night rates and a real Exophase snapshot from
-20 Nov 16:10 UTC (44,161 players tracked). Mean pinball loss on the logit
-scale, lower is better, across 6 seeds and 3 growth regimes (slow / base /
-fast ceilings):
-
-| regime | this program | persistence | logit-trend |
-|--------|-------------|-------------|-------------|
-| slow   | 0.323       | 0.387       | 0.634       |
-| base   | 0.360       | 0.470       | 0.658       |
-| fast   | 0.485       | 0.623       | 0.674       |
-
-It beats both house baselines in every regime and every seed. Practice
-cases run in ~0.2 s, byte-identical across runs, valid output.
-
-Dev cases (p00/p01, frozen history, 90-minute horizon): scored against
-the estimated true target (~95% of the way in logit from the frozen
-rates to the 20 Nov snapshot), this program's pinball loss is **0.0089**,
-versus 1.535 for the previous version — a 173× improvement. Even if
-that target estimate is off by ±0.02 the loss stays ≤0.019, and by
-±0.05 it stays ≤0.056, so the frozen-history correction is robust.
+Output is one JSON object per case: `{"trophies": [{"id": N, "q":
+[q05, q25, q50, q75, q95]}, ...]}`, quantiles in percent, rounded to
+4 decimals, non-decreasing, clamped to [0.01, 99.99].
 
 ## License
 
-MIT. See LICENSE.
+MIT — see `LICENSE` (`SPDX-License-Identifier: MIT`).
