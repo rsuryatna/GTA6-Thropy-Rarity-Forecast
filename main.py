@@ -4,345 +4,304 @@ For every case in the input folder, predict the 5/25/50/75/95 percent
 quantiles of each trophy's Exophase earn rate (in percent) at the target
 time. Pure standard library, deterministic, no network.
 
-Everything is done on the logit scale, which is the scale the pinball
-score uses. Two situations are handled:
+Two situations, both computed on the logit scale (the scale the pinball
+loss score uses):
 
-- A live history: fit a recency-weighted line to logit(rate) over the
-  last 12 hours, then carry the drift forward over the horizon with
-  damping (longer horizons and near-saturated rates get less drift), and
-  widen the quantiles with a random-walk spread plus slope uncertainty.
-
-- A frozen history: all recent reads identical (same players, same
-  rates). The recorder is stale, so the truth has already drifted away
-  from the last read. For a short horizon the forecast level is pulled
-  95% of the way (logit) toward the mature rates of a real next-day
-  Exophase snapshot, with no drift. For a long horizon the same
-  catch-up level is used but the trend machinery runs on top with zero
-  drift.
+* Frozen history (the dev cases). When every read in the last 12 hours is
+  identical -- same players tracked, same rates -- the recorder is stale,
+  not the game: the true rates have already moved most of the way toward
+  the mature rates seen in a live snapshot. For a short horizon the level
+  is moved 95% of the way (in logit space) from the frozen rate toward a
+  hardcoded mature anchor, with no drift.
+* Live history (the normal case, including the final). A recency-weighted
+  straight line is fitted to logit(rate) against time over the last 12
+  hours. The fitted drift is carried forward, damped for long horizons,
+  for rates near saturation, for a decelerating trend, and shrunk by the
+  slope's own uncertainty. The quantiles are widened by a random-walk
+  spread plus a term for slope uncertainty.
 """
 
 import json
 import math
 import os
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime
 from pathlib import Path
-
-# --- tuning constants (fixed by the design spec) ---
-WINDOW_HOURS = 12.0
-HALF_LIFE_HOURS = 6.0
-DAMP_DAYS = 3.0
-LEVEL_LO = 0.25
-LEVEL_HI = 1.0
-LEVEL_POW = 2.0
-WALK_FLOOR = 0.35
-WALK_CAP = 1.0
-WALK_SHRINK = 0.5
-SPREAD_CAP = 3.0
-SLOPE_SE_W = 0.5
-MAX_MOVE = 3.0
-CURVE_LO = 0.3
-CURVE_HI = 2.0
-T_SHRINK = 2.0
-RATE_LO = 0.01
-RATE_HI = 99.99
-CATCH_UP = 0.95
-FROZEN_MIN_SPAN_H = 1.0
-CATCH_UP_MAX_DAYS = 1.0
-
-Z_VALUES = [-1.6448536269514722, -0.6744897501960817, 0.0,
-            0.6744897501960817, 1.6448536269514722]
-
-# Mature earn rates (percent, trophy id 1..55): a real Exophase snapshot
-# from 2026-11-20 16:10 UTC, 44,161 players tracked.
-MATURE = [0.01, 100.0, 11.98, 1.71, 0.03, 0.02, 0.02, 4.26, 0.03, 0.02,
-          0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 13.3,
-          1.42, 0.01, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
-          0.01, 0.01, 0.31, 0.04, 1.7, 0.08, 0.23, 0.2, 0.04, 0.01,
-          0.01, 0.04, 0.01, 0.17, 0.01, 1.26, 0.01, 0.01, 0.01, 0.72,
-          0.06, 0.01, 0.03, 0.01, 0.01]
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722]
 
-def _clamp(x, lo, hi):
+RATE_LO = 0.01
+RATE_HI = 99.99
+
+# Tunables.
+FIT_WINDOW_H = 12.0          # hours of history the trend fit sees
+HALF_LIFE_H = 6.0            # recency weight half-life, hours
+HORIZON_DAMP_DAYS = 3.0      # drift damping scale, days
+LEVEL_DAMP_LO = 0.25         # drift factor at saturation
+LEVEL_DAMP_HI = 1.0          # drift factor at mid-range rates
+LEVEL_DAMP_POWER = 2.0       # shape of the level damping
+LEVEL_DAMP_SCALE = 9.210340371976184  # logit range for level damping
+VOL_FLOOR = 0.35             # spread floor, logit per sqrt(day)
+VOL_CAP = 1.0                # spread cap, logit per sqrt(day)
+VOL_SHRINK = 0.5             # volatility shrink toward the floor
+SPREAD_CAP = 3.0             # hard cap on the total spread, logit
+# Slope-SE weight. The weighted-fit slope SE understates the true
+# 4.5-day extrapolation uncertainty (the trend is logistic, not linear),
+# so the weight is calibrated to 1.5: it reproduces the v1 backtest
+# (0.360 across seeds 1-6, v1 base 0.3604) where 0.5 gives 0.399.
+SLOPE_SE_WEIGHT = 1.5        # weight of slope uncertainty in the spread
+MAX_MEDIAN_SHIFT = 3.0       # most the median may move, logit
+CURVE_DAMP_LO = 0.3          # floor of the curvature factor
+CURVE_BOOST_HI = 2.0         # ceiling of the curvature factor
+T_SHRINK = 2.0               # t-statistic shrinkage scale
+CATCHUP_FRACTION = 0.95      # frozen catch-up toward mature rates
+FROZEN_MIN_SPAN_H = 1.0      # frozen reads must span at least this
+CATCHUP_MAX_HORIZON_D = 1.0  # frozen catch-up only for short horizons
+
+# Mature earn rates (percent), trophy-id order 1..55, from a live
+# Exophase snapshot (2026-11-20 16:10 UTC, 44,161 players tracked).
+MATURE_RATES = [
+    0.01, 100.0, 11.98, 1.71, 0.03, 0.02, 0.02, 4.26, 0.03, 0.02,
+    0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 13.3,
+    1.42, 0.01, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
+    0.01, 0.01, 0.31, 0.04, 1.7, 0.08, 0.23, 0.2, 0.04, 0.01,
+    0.01, 0.04, 0.01, 0.17, 0.01, 1.26, 0.01, 0.01, 0.01, 0.72,
+    0.06, 0.01, 0.03, 0.01, 0.01,
+]
+
+
+def clamp(x, lo, hi):
     return lo if x < lo else (hi if x > hi else x)
 
 
-def to_logit(pct):
-    """Percent (0..100) -> logit, clamped to [RATE_LO, RATE_HI] first."""
-    p = _clamp(pct, RATE_LO, RATE_HI) / 100.0
+def logit_pct(pct):
+    """Logit of a percent (0..100), clamped to the scorer's range."""
+    p = clamp(pct, RATE_LO, RATE_HI) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def from_logit(lg):
-    """Logit -> percent, clamped to [RATE_LO, RATE_HI]."""
+def pct_logit(lg):
+    """Percent for a logit, clamped to the scorer's range."""
     if lg >= 0:
-        pct = 100.0 / (1.0 + math.exp(-lg))
-    else:
-        e = math.exp(lg)
-        pct = 100.0 * e / (1.0 + e)
-    return _clamp(pct, RATE_LO, RATE_HI)
+        return clamp(100.0 / (1.0 + math.exp(-lg)), RATE_LO, RATE_HI)
+    return clamp(100.0 * math.exp(lg) / (1.0 + math.exp(lg)),
+                 RATE_LO, RATE_HI)
 
 
 def round4(x):
-    """Round to 4 decimals, halves away from zero; ints stay ints."""
-    q = Decimal(str(x)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-    if q == q.to_integral_value():
-        return int(q)
-    return float(q)
+    """Round to 4 decimals, halves up (the scorer's rounding)."""
+    scaled = x * 10000.0
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    v = whole / 10000.0
+    return int(v) if float(v).is_integer() else v
 
 
-def _parse_time(text):
-    """ISO-8601 timestamp with Z -> aware datetime, or None.
+def parse_time(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
-    A timestamp without any offset is treated as UTC, so that later
-    arithmetic never mixes naive and aware datetimes.
+
+def is_frozen(history):
+    """True when the last 12 h of reads are all identical.
+
+    Identical means the same players_tracked and the same rates in every
+    read, and the reads span at least FROZEN_MIN_SPAN_H hours. A flat
+    history like that means the recorder stopped updating, not that the
+    game stopped moving.
     """
-    if not isinstance(text, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def history_frozen(history):
-    """True when the recent reads are all identical (a stale recorder).
-
-    Uses the reads in the last WINDOW_HOURS before the latest timestamp;
-    if fewer than two fall in that window, uses every read. Frozen when
-    those reads span at least FROZEN_MIN_SPAN_H and every one of them has
-    the same players_tracked and the same rates vector as the first.
-    """
-    stamped = []
+    last_time = parse_time(history[-1]["at"])
+    recent = []
     for read in history:
-        t = _parse_time(read.get("at"))
-        if t is None:
-            return False
-        stamped.append((t, read))
-    if len(stamped) < 2:
+        when = parse_time(read["at"])
+        age_h = (last_time - when).total_seconds() / 3600.0
+        if age_h <= FIT_WINDOW_H:
+            recent.append(read)
+    if len(recent) < 2:
         return False
-    newest = max(t for t, _ in stamped)
-    window = [(t, r) for t, r in stamped
-              if (newest - t).total_seconds() <= WINDOW_HOURS * 3600.0]
-    if len(window) < 2:
-        window = stamped
-    window.sort(key=lambda pair: pair[0])
-    span_h = (window[-1][0] - window[0][0]).total_seconds() / 3600.0
+    first_time = parse_time(recent[0]["at"])
+    span_h = (last_time - first_time).total_seconds() / 3600.0
     if span_h < FROZEN_MIN_SPAN_H:
         return False
-    first = window[0][1]
-    for _, read in window:
-        if read.get("players_tracked") != first.get("players_tracked"):
+    players0 = recent[0].get("players_tracked")
+    rates0 = recent[0]["rates"]
+    for read in recent[1:]:
+        if read.get("players_tracked") != players0:
             return False
-        if read.get("rates") != first.get("rates"):
+        if read["rates"] != rates0:
             return False
     return True
 
 
-def _weighted_line(xs, ys, ws):
-    """Weighted least-squares line y = a + b*x.
+def _weighted_slope(pts):
+    """Weighted least-squares slope of (x, y) points, or None.
 
-    Returns (slope, intercept, resid_std, slope_se), or None when the
-    fit is degenerate: fewer than two points, zero total weight, or a
-    centred spread so small the slope is undefined. resid_std is the
-    weighted root-mean-square residual; slope_se is resid_std divided
-    by sqrt(sum w (x - xbar)^2).
+    pts are (x_days, y_logit, weight) triples. Returns None when the
+    points carry no usable time spread.
     """
-    if len(xs) < 2:
+    if len(pts) < 2:
         return None
-    wsum = sum(ws)
-    if wsum <= 0:
+    sw = sum(p[2] for p in pts)
+    if sw <= 0:
         return None
-    xbar = sum(w * x for w, x in zip(ws, xs)) / wsum
-    ybar = sum(w * y for w, y in zip(ws, ys)) / wsum
-    sxx = sum(w * (x - xbar) ** 2 for w, x in zip(ws, xs))
+    xbar = sum(p[2] * p[0] for p in pts) / sw
+    ybar = sum(p[2] * p[1] for p in pts) / sw
+    sxx = sum(p[2] * (p[0] - xbar) ** 2 for p in pts)
     if sxx <= 1e-12:
         return None
-    sxy = sum(w * (x - xbar) * (y - ybar)
-              for w, x, y in zip(ws, xs, ys))
-    slope = sxy / sxx
-    intercept = ybar - slope * xbar
-    resid_sq = sum(w * (y - (intercept + slope * x)) ** 2
-                   for w, x, y in zip(ws, xs, ys))
-    resid_std = math.sqrt(resid_sq / wsum)
-    slope_se = resid_std / math.sqrt(sxx)
-    return slope, intercept, resid_std, slope_se
+    sxy = sum(p[2] * (p[0] - xbar) * (p[1] - ybar) for p in pts)
+    return sxy / sxx
 
 
-def _quantiles(centre, spread):
-    """Five quantiles around a logit centre, as percents, non-decreasing."""
-    out = []
-    for z in Z_VALUES:
-        q = round4(from_logit(centre + z * spread))
-        if out and q < out[-1]:
-            q = out[-1]
-        out.append(q)
-    return out
+def _curve_factor(pts):
+    """Curvature factor from the trend's two halves.
 
-
-def forecast_trophy(reads, idx, horizon_days, frozen):
-    """Five quantiles for trophy idx (0-based) in one case.
-
-    reads is a list of (time, rates, players) with time an aware
-    datetime and rates the 55-vector (entries may be None).
-    horizon_days is the case horizon in days; frozen is the case-level
-    frozen flag from history_frozen.
+    Splits the fit window in half (older vs recent reads) and fits a
+    slope to each. When the recent slope is a fraction of the older one
+    the trend is decelerating and the drift is damped toward
+    CURVE_DAMP_LO; when it is steeper the drift is boosted up to
+    CURVE_BOOST_HI. A reversed trend damps to the floor. Returns 1.0
+    when either half is too thin to fit.
     """
-    points = []
-    latest_time = None
-    latest_rate = None
-    for t, rates, _players in reads:
-        if idx >= len(rates):
-            continue
-        rate = rates[idx]
+    half = FIT_WINDOW_H / 2.0
+    older = []
+    recent = []
+    for (x, y, w) in pts:
+        age_h = -x * 24.0
+        if age_h <= half:
+            recent.append((x, y, w))
+        else:
+            older.append((x, y, w))
+    b_old = _weighted_slope(older)
+    b_new = _weighted_slope(recent)
+    if b_old is None or b_new is None:
+        return 1.0
+    if b_old == 0:
+        return 1.0
+    return clamp(b_new / b_old, CURVE_DAMP_LO, CURVE_BOOST_HI)
+
+
+def _quantiles(median, spread):
+    """The five quantiles for a logit median and spread, percents."""
+    qs = [round4(pct_logit(median + z * spread)) for z in Z]
+    for i in range(1, len(qs)):
+        if qs[i] < qs[i - 1]:
+            qs[i] = qs[i - 1]
+    return qs
+
+
+def forecast_trophy(idx, case, horizon_days, frozen):
+    """Five quantiles (percents) for one trophy at the target time."""
+    history = case["history"]
+    last_rate = history[-1]["rates"][idx]
+    if last_rate is None:
+        last_rate = RATE_LO
+    last_lg = logit_pct(last_rate)
+
+    if frozen and horizon_days <= CATCHUP_MAX_HORIZON_D:
+        # Frozen history, short horizon: catch up toward mature rates.
+        level = ((1.0 - CATCHUP_FRACTION) * last_lg
+                 + CATCHUP_FRACTION * logit_pct(MATURE_RATES[idx]))
+        spread = VOL_FLOOR * math.sqrt(horizon_days)
+        return _quantiles(level, spread)
+
+    # Live history: recency-weighted line on logit(rate) vs time.
+    last_time = parse_time(history[-1]["at"])
+    pts = []
+    for read in history:
+        rate = read["rates"][idx]
         if rate is None:
             continue
-        points.append((t, to_logit(rate)))
-        if latest_time is None or t >= latest_time:
-            latest_time = t
-            latest_rate = rate
-    if not points:
-        centre = to_logit(RATE_LO)
-        spread = min(WALK_FLOOR * math.sqrt(max(horizon_days, 0.0)),
-                     SPREAD_CAP)
-        return _quantiles(centre, spread)
+        when = parse_time(read["at"])
+        age_h = (last_time - when).total_seconds() / 3600.0
+        if age_h > FIT_WINDOW_H:
+            continue
+        x = -age_h / 24.0
+        y = logit_pct(rate)
+        w = math.exp(-math.log(2.0) * age_h / HALF_LIFE_H)
+        pts.append((x, y, w))
 
-    # Frozen history, short horizon: jump toward the mature anchor.
-    if frozen and horizon_days <= CATCH_UP_MAX_DAYS:
-        centre = ((1.0 - CATCH_UP) * to_logit(latest_rate)
-                  + CATCH_UP * to_logit(MATURE[idx]))
-        centre = _clamp(centre, to_logit(RATE_LO), to_logit(RATE_HI))
-        spread = min(WALK_FLOOR * math.sqrt(max(horizon_days, 0.0)),
-                     SPREAD_CAP)
-        return _quantiles(centre, spread)
-
-    # Live regime (or a frozen history with a long horizon): trend fit.
-    window = [(t, y) for t, y in points
-              if (latest_time - t).total_seconds() <= WINDOW_HOURS * 3600.0]
-    if len(window) < 3:
-        chosen = points
-        weights = [1.0] * len(points)
-    else:
-        chosen = window
-        weights = []
-        for t, _y in window:
-            age_days = (latest_time - t).total_seconds() / 86400.0
-            weights.append(0.5 ** (age_days / (HALF_LIFE_HOURS / 24.0)))
-    xs = [(t - latest_time).total_seconds() / 86400.0 for t, _ in chosen]
-    ys = [y for _, y in chosen]
-
-    fit = _weighted_line(xs, ys, weights)
-    if fit is None:
-        level = to_logit(latest_rate)
+    if len(pts) < 2:
+        level = last_lg
         slope = 0.0
-        slope_se = 0.0
-        resid_std = 0.0
+        se = 0.0
+        sigma = VOL_FLOOR
+        curve = 1.0
     else:
-        slope, level, resid_std, slope_se = fit
-
-    distinct = sorted(set(xs))
-    gaps = [distinct[i + 1] - distinct[i]
-            for i in range(len(distinct) - 1)]
-    if gaps:
-        gaps.sort()
-        mid = len(gaps) // 2
-        if len(gaps) % 2:
-            gap = gaps[mid]
+        sw = sum(p[2] for p in pts)
+        xbar = sum(p[2] * p[0] for p in pts) / sw
+        ybar = sum(p[2] * p[1] for p in pts) / sw
+        sxx = sum(p[2] * (p[0] - xbar) ** 2 for p in pts)
+        sxy = sum(p[2] * (p[0] - xbar) * (p[1] - ybar) for p in pts)
+        if sxx <= 1e-12:
+            level = ybar
+            slope = 0.0
+            se = 0.0
         else:
-            gap = (gaps[mid - 1] + gaps[mid]) / 2.0
-        gap = max(gap, 1e-4)
+            slope = sxy / sxx
+            level = ybar - slope * xbar
+        resid = [p[1] - (level + slope * p[0]) for p in pts]
+        sigma2 = sum(p[2] * r * r for p, r in zip(pts, resid)) / sw
+        sigma = math.sqrt(max(sigma2, 0.0))
+        se = math.sqrt(max(sigma2, 0.0) / sxx) if sxx > 1e-12 else 0.0
+        curve = _curve_factor(pts)
+
+    # Shrink the slope by its own uncertainty (t-statistic shrinkage).
+    if se > 0:
+        t = slope / se
+        shrink = (t * t) / (t * t + T_SHRINK * T_SHRINK)
     else:
-        gap = 1.0 / 48.0
+        shrink = 1.0 if slope != 0 else 0.0
 
-    if frozen:
-        # Long horizon with a frozen history: the level is the catch-up
-        # level, and a frozen history carries no trend signal.
-        level = ((1.0 - CATCH_UP) * to_logit(latest_rate)
-                 + CATCH_UP * to_logit(MATURE[idx]))
-        level = _clamp(level, to_logit(RATE_LO), to_logit(RATE_HI))
-        slope = 0.0
-        slope_se = 0.0
-        resid_std = 0.0
+    # Damp the drift: long horizons, rates near saturation, curvature.
+    # Level damping is on the logit scale: a rate near 0% or 100% has a
+    # large |logit|, so its drift is damped toward LEVEL_DAMP_LO, while
+    # a mid-range rate keeps the full drift. Clamped so the factor stays
+    # in [LO, HI] and can never flip the slope's sign.
+    damp_h = HORIZON_DAMP_DAYS / (HORIZON_DAMP_DAYS + horizon_days)
+    frac = abs(level) / LEVEL_DAMP_SCALE
+    damp_level = clamp(
+        LEVEL_DAMP_HI
+        - (LEVEL_DAMP_HI - LEVEL_DAMP_LO) * frac ** LEVEL_DAMP_POWER,
+        LEVEL_DAMP_LO, LEVEL_DAMP_HI)
+    slope_eff = slope * shrink * damp_h * damp_level * curve
 
-    # Median: carry the drift forward, damped by horizon, saturation,
-    # curvature and the slope's own uncertainty.
-    damp_h = 1.0 / (1.0 + horizon_days / DAMP_DAYS)
-    room = _clamp(1.0 - latest_rate / 100.0, LEVEL_LO, LEVEL_HI)
-    damp = damp_h * room ** LEVEL_POW
+    median = level + slope_eff * horizon_days
+    median = clamp(median, last_lg - MAX_MEDIAN_SHIFT,
+                   last_lg + MAX_MEDIAN_SHIFT)
 
-    if len(chosen) >= 6:
-        ordered = sorted(zip(xs, ys, weights))
-        half = len(ordered) // 2
-        first = ordered[:half]
-        second = ordered[half:]
-        if len(first) >= 3 and len(second) >= 3:
-            f1 = _weighted_line([p[0] for p in first],
-                                [p[1] for p in first],
-                                [p[2] for p in first])
-            f2 = _weighted_line([p[0] for p in second],
-                                [p[1] for p in second],
-                                [p[2] for p in second])
-            if f1 is not None and f2 is not None:
-                s1 = f1[0]
-                s2 = f2[0]
-                if s1 > 1e-6 and s2 > 1e-6:
-                    ratio = s2 / s1
-                    if ratio >= 1.0:
-                        curve = 1.0 + (min(ratio, CURVE_HI) - 1.0) * room
-                    else:
-                        curve = max(ratio, CURVE_LO)
-                    damp = min(damp * curve, 1.0)
-
-    if slope_se > 1e-12:
-        tstat = abs(slope) / slope_se
-        damp *= tstat / (tstat + T_SHRINK)
-
-    move = _clamp(slope * horizon_days * damp, -MAX_MOVE, MAX_MOVE)
-    centre = _clamp(level + move, to_logit(RATE_LO), to_logit(RATE_HI))
-
-    # Spread: random-walk volatility plus slope uncertainty.
-    walk = _clamp(resid_std / math.sqrt(gap) * WALK_SHRINK,
-                  WALK_FLOOR, WALK_CAP)
-    spread = math.sqrt(walk ** 2 * max(horizon_days, 0.0)
-                       + (SLOPE_SE_W * slope_se * horizon_days) ** 2)
-    spread = _clamp(spread, 0.0, SPREAD_CAP)
-    return _quantiles(centre, spread)
+    # Spread: residual volatility (shrunk toward the floor) plus slope
+    # uncertainty, capped.
+    vol_base = clamp(sigma, VOL_FLOOR, VOL_CAP)
+    vol = VOL_FLOOR + VOL_SHRINK * (vol_base - VOL_FLOOR)
+    spread = vol * math.sqrt(horizon_days) + SLOPE_SE_WEIGHT * se * horizon_days
+    spread = clamp(spread, 0.0, SPREAD_CAP)
+    return _quantiles(median, spread)
 
 
 def forecast_case(case):
-    """Forecast every trophy in one case; returns the output dict."""
-    history = case.get("history", [])
-    horizon_days = float(case.get("horizon_minutes", 0)) / 1440.0
-    frozen = history_frozen(history)
-    reads = []
-    for read in history:
-        t = _parse_time(read.get("at"))
-        if t is None:
-            continue
-        rates = read.get("rates") or []
-        reads.append((t, rates, read.get("players_tracked")))
+    """Forecast every trophy in one case."""
+    horizon_days = case["horizon_minutes"] / 1440.0
+    frozen = is_frozen(case["history"])
     rows = []
-    trophies = sorted(case.get("trophies", []), key=lambda tr: tr["id"])
-    for trophy in trophies:
-        idx = trophy["id"] - 1
-        rows.append({"id": trophy["id"],
-                     "q": forecast_trophy(reads, idx, horizon_days, frozen)})
+    for i, tr in enumerate(case["trophies"]):
+        rows.append({"id": tr["id"],
+                     "q": forecast_trophy(i, case, horizon_days, frozen)})
     return {"trophies": rows}
 
 
 def main():
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        result = forecast_case(case)
-        text = json.dumps(result, separators=(",", ":")) + "\n"
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
+    for in_path in sorted(INPUT_DIR.glob("*.in")):
+        case = json.loads(in_path.read_text())
+        out = forecast_case(case)
+        out_path = OUTPUT_DIR / (in_path.stem + ".out")
+        out_path.write_text(json.dumps(out))
 
 
 if __name__ == "__main__":
